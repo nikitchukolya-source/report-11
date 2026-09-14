@@ -3,9 +3,21 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import requests
 
+
+# =====================================================================
+# ЧАСОВИЙ ПОЯС
+# =====================================================================
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+# =====================================================================
+# КОНФІГУРАЦІЯ
+# =====================================================================
 
 UNITALK_API_KEY = os.environ.get("UNITALK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -32,6 +44,10 @@ EXCLUDED_MANAGERS = {
     "Молокова",
 }
 
+
+# =====================================================================
+# API
+# =====================================================================
 
 def headers():
     return {
@@ -82,6 +98,10 @@ def get_managers():
 
 
 def get_calls(date_from, date_to):
+    """
+    Беремо всі дзвінки — і IN, і OUT.
+    Фільтр direction не задаємо.
+    """
     calls = []
     offset = 0
 
@@ -94,7 +114,6 @@ def get_calls(date_from, date_to):
                 "dateTo": date_to.strftime(DATE_FORMAT),
                 "limit": 1000,
                 "offset": offset,
-                "filter": {"direction": "OUT"},
             },
             timeout=30,
         )
@@ -115,45 +134,129 @@ def get_calls(date_from, date_to):
     return calls
 
 
+# =====================================================================
+# ПІДРАХУНОК
+# =====================================================================
+
+def call_targets(call):
+    raw = call.get("to", [])
+
+    if isinstance(raw, list):
+        return [
+            str(item)
+            for item in raw
+            if item is not None
+        ]
+
+    if raw is None:
+        return []
+
+    return [str(raw)]
+
+
+def manager_lines_for_call(call, managers):
+    """
+    OUT:
+      менеджер визначається по внутрішній лінії у полі from.
+
+    IN:
+      менеджери визначаються по внутрішніх лініях у полі to.
+
+    Якщо один менеджер зустрічається в маршруті одного дзвінка
+    кілька разів — цей дзвінок зараховується йому лише один раз.
+    """
+
+    direction = call.get("direction")
+
+    if direction == "OUT":
+        line = str(call.get("from") or "")
+        return [line] if line in managers else []
+
+    if direction == "IN":
+        result = []
+        seen = set()
+
+        for target in call_targets(call):
+            line = str(target)
+
+            if line in managers and line not in seen:
+                result.append(line)
+                seen.add(line)
+
+        return result
+
+    return []
+
+
 def count_calls_over_45(calls, managers):
-    counts = {line: 0 for line in managers}
+    """
+    Рахуємо всі вхідні та вихідні дзвінки,
+    де фактична розмова тривала БІЛЬШЕ 45 секунд.
+    """
+
+    counts = {
+        line: 0
+        for line in managers
+    }
 
     for call in calls:
-        if call.get("direction") != "OUT":
-            continue
-
-        manager_line = str(call.get("from") or "")
-
-        if manager_line not in counts:
-            continue
-
         talk_seconds = int(
             call.get("secondsTalk", 0) or 0
         )
 
-        if talk_seconds >= 45:
-            counts[manager_line] += 1
+        # Саме > 45 секунд.
+        if talk_seconds <= 45:
+            continue
+
+        for line in manager_lines_for_call(
+            call,
+            managers,
+        ):
+            counts[line] += 1
 
     return counts
 
 
+# =====================================================================
+# ЗВІТ 12 VS 13
+# =====================================================================
+
 def build_report():
-    now = datetime.now()
+    # Явно використовуємо київський час,
+    # незалежно від timezone хмарної пісочниці.
+    now = datetime.now(KYIV_TZ)
     today = now.date()
 
-    date_from = datetime.combine(today, time(0, 0))
-    twelve = datetime.combine(today, time(12, 0))
-    thirteen = datetime.combine(today, time(13, 0))
+    date_from = datetime.combine(
+        today,
+        time(0, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    twelve = datetime.combine(
+        today,
+        time(12, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    thirteen = datetime.combine(
+        today,
+        time(13, 0),
+        tzinfo=KYIV_TZ,
+    )
 
     managers = get_managers()
 
-    # ОКРЕМИЙ запит для стану на 12:00
+    # ВАЖЛИВО:
+    # для кожної колонки робимо окремий запит до UniTalk.
+
+    # Станом на 12:00
     calls_12 = get_calls(
         date_from,
         min(now, twelve),
     )
 
-    # ОКРЕМИЙ запит для стану на 13:00
+    # Станом на 13:00
     calls_13 = get_calls(
         date_from,
         min(now, thirteen),
@@ -206,6 +309,10 @@ def build_report():
     return text
 
 
+# =====================================================================
+# TELEGRAM
+# =====================================================================
+
 def send_telegram(text):
     url = (
         f"https://api.telegram.org/"
@@ -224,6 +331,10 @@ def send_telegram(text):
         )
         response.raise_for_status()
 
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 def main():
     if not UNITALK_API_KEY:
