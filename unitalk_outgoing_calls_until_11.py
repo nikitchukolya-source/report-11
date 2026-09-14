@@ -3,9 +3,21 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import requests
 
+
+# =====================================================================
+# ЧАСОВИЙ ПОЯС
+# =====================================================================
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+# =====================================================================
+# КОНФІГУРАЦІЯ
+# =====================================================================
 
 UNITALK_API_KEY = os.environ.get("UNITALK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -29,9 +41,13 @@ EXCLUDED_MANAGERS = {
     "Матенька",
     "Тимошенко",
     "Липка",
-    "Молокова"
+    "Молокова",
 }
 
+
+# =====================================================================
+# API
+# =====================================================================
 
 def headers():
     return {
@@ -82,6 +98,10 @@ def get_managers():
 
 
 def get_calls(date_from, date_to):
+    """
+    Для звіту на 11:00 беремо абсолютно всі дзвінки:
+    і IN, і OUT.
+    """
     calls = []
     offset = 0
 
@@ -94,7 +114,6 @@ def get_calls(date_from, date_to):
                 "dateTo": date_to.strftime(DATE_FORMAT),
                 "limit": 1000,
                 "offset": offset,
-                "filter": {"direction": "OUT"},
             },
             timeout=30,
         )
@@ -115,16 +134,70 @@ def get_calls(date_from, date_to):
     return calls
 
 
-def build_report():
-    now = datetime.now()
-    today = now.date()
+# =====================================================================
+# ПІДРАХУНОК ДЗВІНКІВ
+# =====================================================================
 
-    date_from = datetime.combine(today, time(0, 0))
-    eleven = datetime.combine(today, time(11, 0))
-    date_to = min(now, eleven)
+def call_targets(call):
+    raw = call.get("to", [])
 
-    managers = get_managers()
-    calls = get_calls(date_from, date_to)
+    if isinstance(raw, list):
+        return [
+            str(item)
+            for item in raw
+            if item is not None
+        ]
+
+    if raw is None:
+        return []
+
+    return [str(raw)]
+
+
+def manager_lines_for_call(call, managers):
+    """
+    OUT:
+      менеджер = внутрішня лінія у полі from.
+
+    IN:
+      менеджери = внутрішні лінії у полі to.
+
+    Якщо один і той самий менеджер зустрічається
+    у маршруті одного дзвінка кілька разів,
+    зараховуємо йому цей дзвінок лише один раз.
+    """
+
+    direction = call.get("direction")
+
+    if direction == "OUT":
+        line = str(call.get("from") or "")
+        return [line] if line in managers else []
+
+    if direction == "IN":
+        result = []
+        seen = set()
+
+        for target in call_targets(call):
+            line = str(target)
+
+            if line in managers and line not in seen:
+                result.append(line)
+                seen.add(line)
+
+        return result
+
+    return []
+
+
+def count_all_calls(calls, managers):
+    """
+    Рахуємо абсолютно всі дзвінки:
+    - вхідні;
+    - вихідні;
+    - успішні;
+    - недодзвони;
+    - будь-якої тривалості.
+    """
 
     counts = {
         line: 0
@@ -132,13 +205,52 @@ def build_report():
     }
 
     for call in calls:
-        if call.get("direction") != "OUT":
-            continue
+        for line in manager_lines_for_call(
+            call,
+            managers,
+        ):
+            counts[line] += 1
 
-        manager_line = str(call.get("from") or "")
+    return counts
 
-        if manager_line in counts:
-            counts[manager_line] += 1
+
+# =====================================================================
+# ЗВІТ НА 11:00
+# =====================================================================
+
+def build_report():
+    # Хмарна пісочниця може працювати в UTC,
+    # тому явно використовуємо київський час.
+    now = datetime.now(KYIV_TZ)
+    today = now.date()
+
+    date_from = datetime.combine(
+        today,
+        time(0, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    eleven = datetime.combine(
+        today,
+        time(11, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    # Якщо скрипт запущений раніше 11:00,
+    # беремо дані лише до фактичного моменту запуску.
+    # Після 11:00 межа завжди 11:00.
+    date_to = min(now, eleven)
+
+    managers = get_managers()
+    calls = get_calls(
+        date_from,
+        date_to,
+    )
+
+    counts = count_all_calls(
+        calls,
+        managers,
+    )
 
     rows = [
         (name, counts[line])
@@ -146,11 +258,14 @@ def build_report():
     ]
 
     rows.sort(
-        key=lambda row: (-row[1], row[0].lower())
+        key=lambda row: (
+            -row[1],
+            row[0].lower(),
+        )
     )
 
     text = (
-        f"📞 <b>Спроби дзвінків на 11:00</b>\n"
+        f"📞 <b>Всі дзвінки на 11:00</b>\n"
         f"<b>{today.strftime('%d.%m.%Y')}</b>\n\n"
         f"<pre>"
         f"{'Менеджер':<20} {'на 11':>5}\n"
@@ -158,12 +273,19 @@ def build_report():
     )
 
     for name, count in rows:
-        text += f"{html.escape(name):<20} {count:>5}\n"
+        text += (
+            f"{html.escape(name):<20} "
+            f"{count:>5}\n"
+        )
 
     text += "</pre>"
 
     return text
 
+
+# =====================================================================
+# TELEGRAM
+# =====================================================================
 
 def send_telegram(text):
     url = (
@@ -183,6 +305,10 @@ def send_telegram(text):
         )
         response.raise_for_status()
 
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 def main():
     if not UNITALK_API_KEY:
