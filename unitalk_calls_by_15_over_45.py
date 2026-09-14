@@ -3,9 +3,21 @@ from __future__ import annotations
 import html
 import os
 from datetime import datetime, time
+from zoneinfo import ZoneInfo
 
 import requests
 
+
+# =====================================================================
+# ЧАСОВИЙ ПОЯС
+# =====================================================================
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+# =====================================================================
+# КОНФІГУРАЦІЯ
+# =====================================================================
 
 UNITALK_API_KEY = os.environ.get("UNITALK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -29,9 +41,13 @@ EXCLUDED_MANAGERS = {
     "Матенька",
     "Тимошенко",
     "Липка",
-    "Молокова"
+    "Молокова",
 }
 
+
+# =====================================================================
+# API
+# =====================================================================
 
 def headers():
     return {
@@ -82,6 +98,10 @@ def get_managers():
 
 
 def get_calls(date_from, date_to):
+    """
+    Беремо всі дзвінки — і IN, і OUT.
+    Фільтр direction не задаємо.
+    """
     calls = []
     offset = 0
 
@@ -94,7 +114,6 @@ def get_calls(date_from, date_to):
                 "dateTo": date_to.strftime(DATE_FORMAT),
                 "limit": 1000,
                 "offset": offset,
-                "filter": {"direction": "OUT"},
             },
             timeout=30,
         )
@@ -115,16 +134,65 @@ def get_calls(date_from, date_to):
     return calls
 
 
-def build_report():
-    now = datetime.now()
-    today = now.date()
+# =====================================================================
+# ПІДРАХУНОК
+# =====================================================================
 
-    date_from = datetime.combine(today, time(0, 0))
-    fifteen = datetime.combine(today, time(15, 0))
-    date_to = min(now, fifteen)
+def call_targets(call):
+    raw = call.get("to", [])
 
-    managers = get_managers()
-    calls = get_calls(date_from, date_to)
+    if isinstance(raw, list):
+        return [
+            str(item)
+            for item in raw
+            if item is not None
+        ]
+
+    if raw is None:
+        return []
+
+    return [str(raw)]
+
+
+def manager_lines_for_call(call, managers):
+    """
+    OUT:
+      менеджер визначається по внутрішній лінії у полі from.
+
+    IN:
+      менеджери визначаються по внутрішніх лініях у полі to.
+
+    Якщо один менеджер зустрічається в маршруті одного дзвінка
+    кілька разів — цей дзвінок зараховується йому лише один раз.
+    """
+
+    direction = call.get("direction")
+
+    if direction == "OUT":
+        line = str(call.get("from") or "")
+        return [line] if line in managers else []
+
+    if direction == "IN":
+        result = []
+        seen = set()
+
+        for target in call_targets(call):
+            line = str(target)
+
+            if line in managers and line not in seen:
+                result.append(line)
+                seen.add(line)
+
+        return result
+
+    return []
+
+
+def count_calls_from_45(calls, managers):
+    """
+    Рахуємо всі вхідні та вихідні дзвінки,
+    де фактична розмова тривала 45 секунд або більше.
+    """
 
     counts = {
         line: 0
@@ -132,22 +200,61 @@ def build_report():
     }
 
     for call in calls:
-        if call.get("direction") != "OUT":
-            continue
-
-        manager_line = str(call.get("from") or "")
-
-        if manager_line not in counts:
-            continue
-
         talk_seconds = int(
             call.get("secondsTalk", 0) or 0
         )
 
-        # Рахуємо тільки вихідні дзвінки,
-        # де фактична розмова тривала 45 секунд або більше.
-        if talk_seconds >= 45:
-            counts[manager_line] += 1
+        # "Від 45 секунд" = 45 секунд і більше.
+        if talk_seconds < 45:
+            continue
+
+        for line in manager_lines_for_call(
+            call,
+            managers,
+        ):
+            counts[line] += 1
+
+    return counts
+
+
+# =====================================================================
+# ЗВІТ НА 15:00
+# =====================================================================
+
+def build_report():
+    # Явно використовуємо київський час,
+    # незалежно від timezone хмарної пісочниці.
+    now = datetime.now(KYIV_TZ)
+    today = now.date()
+
+    date_from = datetime.combine(
+        today,
+        time(0, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    fifteen = datetime.combine(
+        today,
+        time(15, 0),
+        tzinfo=KYIV_TZ,
+    )
+
+    # Після 15:00 межа завжди 15:00.
+    # Якщо скрипт випадково запустили раніше —
+    # беремо дані лише до фактичного моменту запуску.
+    date_to = min(now, fifteen)
+
+    managers = get_managers()
+
+    calls = get_calls(
+        date_from,
+        date_to,
+    )
+
+    counts = count_calls_from_45(
+        calls,
+        managers,
+    )
 
     rows = [
         (name, counts[line])
@@ -155,11 +262,14 @@ def build_report():
     ]
 
     rows.sort(
-        key=lambda row: (-row[1], row[0].lower())
+        key=lambda row: (
+            -row[1],
+            row[0].lower(),
+        )
     )
 
     text = (
-        f"📞 <b>На 15:00, &gt;45 сек</b>\n"
+        f"📞 <b>На 15:00, від 45 сек</b>\n"
         f"<b>{today.strftime('%d.%m.%Y')}</b>\n\n"
         f"<pre>"
         f"{'Менеджер':<20} {'на 15':>5}\n"
@@ -167,12 +277,19 @@ def build_report():
     )
 
     for name, count in rows:
-        text += f"{html.escape(name):<20} {count:>5}\n"
+        text += (
+            f"{html.escape(name):<20} "
+            f"{count:>5}\n"
+        )
 
     text += "</pre>"
 
     return text
 
+
+# =====================================================================
+# TELEGRAM
+# =====================================================================
 
 def send_telegram(text):
     url = (
@@ -192,6 +309,10 @@ def send_telegram(text):
         )
         response.raise_for_status()
 
+
+# =====================================================================
+# MAIN
+# =====================================================================
 
 def main():
     if not UNITALK_API_KEY:
